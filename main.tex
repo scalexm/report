@@ -1,0 +1,884 @@
+\documentclass[twocolumn]{article}
+\usepackage{fontspec}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{minted}
+\usepackage{nth}
+\usepackage[backend=biber, sorting=none]{biblatex}
+\usepackage{hyperref}
+ 
+\addbibresource{biblio.bib}
+
+\newcommand{\rust}[1]{\mintinline{rust}{#1}}
+\newcommand{\cpp}[1]{\mintinline{c++}{#1}}
+\newcommand{\mtext}[1]{\mintinline{text}{#1}}
+\newcommand{\mrust}[1]{\text{\rust{#1}}}
+\newcommand{\pif}[0]{:\!\!-\,}
+
+\begin{document}
+
+\author{Alexandre Martin}
+\title{Lowering Rust traits to logic}
+\date{May \nth{22}, 2017 - August \nth{11}, 2017}
+
+\twocolumn[
+  \begin{@twocolumnfalse}
+    \maketitle
+    \begin{abstract}
+    This is a report for my 12 weeks internship in the Rust Research team at Mozilla. My internship was supervised by Nicholas Matsakis who is a researcher at Mozilla, member of the Rust core team and lead member of the compiler and language teams.
+
+    I worked on formalizing and writing a normative implementation of Rust's trait system. Within this normative implementation, we successfully outlined and prototyped a design for a longly discussed extension to the Rust language. Finally, I worked a bit on the Rust compiler itself: this was a good start for getting acquainted with the compiler codebase and possibly being able to contribute to a rewrite of the trait system in the compiler.
+    
+    The first section will be presenting Rust briefly as well as the features that we will need in this report, in a very informal way. The second section will present the main topic of my internship, which is a logic programming language called Chalk, and the work I have done on it. Finally, the third section will discuss future work and will serve as a conclusion.
+    \end{abstract}
+    
+    \tableofcontents
+  \end{@twocolumnfalse}
+]
+
+\clearpage
+
+\section{The Rust programming language}
+\subsection{Introduction}
+\textit{Rust} \cite{rust-lang} is a fairly recent systems programming language which aims at being safe, concurrent and fast. Its first stable version (Rust 1.0) was released in May 2015. Here's how to write an \textit{Hello World} program in Rust:
+%
+\begin{minted}{rust}
+fn main() {
+    println!("Hello world!");
+}
+\end{minted}
+%
+Rust is sponsored by Mozilla Research and is maintained by a large open-source community \cite{rust-repo}, including both Mozilla employees and volunteer contributors.
+
+The main specificity of Rust is its type system which enables performing most of its safety checks at compile time, hence resulting in both optimal code generation and security against programmer errors.
+
+Let's take a simple C++ program as an example:
+\begin{minted}[linenos]{c++}
+#include <iostream>
+#include <unordered_set>
+
+int main() {
+    std::unordered_set<int> set = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9
+    };
+    
+    // Each time we find a number smaller
+    // than `5`, we remove it.
+    for (auto elem : set) {
+        if (elem < 5)
+            set.erase(elem);
+    }
+    
+    // Print the contents of the set.
+    for (auto elem : set) {
+        std::cout << elem << ",";
+    }
+}
+\end{minted}
+Here we are manipulating a C++ \cpp{unordered_set<int>}, a standard container that contains a set of unique integers, providing $O(1)$ methods for insertion, search and removal. We are trying to remove all elements smaller than $5$ from such a container named \cpp{set} and then print the contents of \cpp{set}. If we try to run this code, one possible output might be: \mtext{2,3,4,5,6,7,8,9,} \cite{example1}. Of course, we expected something more like \mtext{5,6,7,8,9,}. What has possibly gone wrong?
+
+Actually the previous program may have run as we initially expected\footnote{provided that we have a definition of what "run as expected" means}, but it may also have done something totally different or even crashed. What just happened here is that we triggered the dreaded \textit{undefined beahavior}. The range-based \textit{for loop} spreading from line $11$ to $14$ actually desugars to a more primitive \textit{for loop}:
+\begin{minted}{c++}
+auto end = set.end();
+for (auto it = set.begin(); it != end; ++it) {
+    int elem = *it;
+    if (elem < 5)
+        set.erase(elem);
+}
+\end{minted}
+The \cpp{begin} method returns some kind of pointer to a memory location corresponding to the beginning of \cpp{set}. Then for each iteration, we check whether our pointer (named \cpp{it}) points to the end of \cpp{set}, in which case our loop is over. Else we execute the body of the loop and go to the next memory location by doing \cpp{++it}. When we find a memory location which contents is smaller than $5$, we remove this memory location from \cpp{set}. But this means that our pointer \cpp{it} is now pointing to an invalid memory location, hence the next call to \cpp{++it} is just \textit{plainly wrong}. Some implementations\footnote{e.g. both libc++ and libstdc++} of the C++ standard library will modify an internal database in order to make \cpp{++it} arbitrarily point to the end of \cpp{set} in this case, so that our loop terminates just after having removed the first element (explaining the output described in the previous paragraph). And some others won't, leaving \cpp{it} pointing to an invalid memory location, meaning that our program may try to dereference a dangling pointer in the next loop iteration.
+
+The main problem in our previous code is that we try to mutate \cpp{set} while iterating over it. This is extremely similar to data races in concurrent programs where a thread tries to write a value to a memory location while some other threads are reading to the same memory location\footnote{actually mutability and thread safety are deeply intricated, for example an immutable object is inherently thread safe}.
+
+So now let's write a Rust one-to-one translation of our C++ program:
+\begin{minted}[linenos]{rust}
+use std::collections::HashSet;
+
+fn main() {
+    let data =
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let mut set: HashSet<_> =
+        data.into_iter().collect();
+    
+    for &elem in &set {
+        if elem < 5 {
+            set.remove(&elem);
+        }
+    }
+    
+    for &elem in &set {
+        print!("{},", elem);
+    }
+    println!();
+}
+\end{minted}
+But this time if we try to compile our program \cite{example2}, the compiler will shout at us:
+\begin{minted}{text}
+error[E0502]: cannot borrow `set` as mutable
+because it is also borrowed as immutable
+   |
+9  |     for &elem in &set {
+   |                   --- immutable borrow
+   |                       occurs here
+10 |         if elem < 5 {
+11 |             set.remove(&elem);
+   |             ^^^ mutable borrow
+   |                 occurs here
+12 |         }
+13 |     }
+   |     - immutable borrow ends here
+\end{minted}
+The compiler rightfully tells us that we are trying to mutate \rust{set} on line $11$, but there already is a reading operation on \rust{set} spreading from line $9$ to $13$ (we are iterating over it).
+
+This example shows why languages like C and C++ are fundamentally flawed, and how Rust tries to address these flaws. Most modern languages address these by providing an heavy runtime environment and preventing the programmer from manually managing memory. While this approach is fine for many use cases\footnote{demonstrated by the success of e.g. Java and Python} and has many other advantages (high maintainability, low compile times, friendly debug environment...), this inevitably leads to lower runtime performances\footnote{although sometimes lead to higher runtime performances, for example when the garbage collector is able to manage memory in a better way than a programmer would have done on their own} and is unsuitable for low-level programming where one \textit{needs} control over memory. Moreover in these languages, a programmer logic error of the kind we have seen previously is often caught at runtime (for example in Java, an exception of type \mintinline{java}{java.util.ConcurrentModificationException} will be thrown \cite{java-doc}). While this is still better than having a non-deterministic behavior as in C++, the program should not even have run in the first place since it was wrong! This is the approach taken by Rust: if a program ever compiles, then it should have the expressed behavior.
+
+Hopefully we won't have to cover all Rust's features in this report, as Rust is not a simple language at all. While this introduction was basically a broad presentation of Rust's goals and initial motivation, we will focus essentially on some specific key features of Rust: \textit{traits}, \textit{generics} and type inference. The next subsections will be willingly written in an informal style as it will be less confusing for the reader and a deep formalization of the language would not serve our purpose anyway. Also, we won't focus too much on Rust's syntax as it should be clear enough what the code snippets which will follow do without understanding the whole syntax.
+
+\subsection{Traits}
+Traits are a way to describe a functionality that types may implement. A similar feature is to be found in other languages: \textit{interfaces} in Java and C\#, traits in Scala, \textit{type classes} in Haskell and Coq... Traits in Rust have been inspired by \cite{traits}. Here is an example of a trait:
+\begin{minted}{rust}
+trait Named {
+    fn name(&self) -> String;
+}
+\end{minted}
+
+We are declaring a trait called \rust{Named} and we are saying that any type implementing the \rust{Named} trait has to provide a method called \rust{name} (the \rust{fn} keyword stands for \textit{function}) which returns a \rust{String} (Rust's built-in type for handling UTF-8 character strings).
+Now, a programmer can explicitly opt to implement a trait for their own types, by providing an implementation for the methods written in the trait declaration. Taking back our \rust{Named} example:
+\begin{minted}{rust}
+// A type called `Cat`.
+struct Cat;
+
+// We decide to implement the `Named` trait
+// for our type `Cat`, by providing our own
+// implementation of the `name` method.
+impl Named for Cat {
+    fn name(&self) -> String {
+        "cat".to_string()
+    }
+}
+
+struct Dolphin;
+
+impl Named for Dolphin {
+    fn name(&self) -> String {
+        "dolphin".to_string()
+    }
+}
+
+struct NoNameSorry;
+// We decide not to implement the `Named`
+// trait for our type `NoNameSorry`.
+\end{minted}
+Blocks labelled with \rust{impl} are used to implement a trait for a given type. Types for which an \rust{impl} block for a trait has been found can then use the methods written in the trait declaration. Every other type is assumed not to implement the trait. With our previous code snippet, we can then call the \rust{name} method with \rust{Cat} and \rust{Dolphin} types:
+\begin{minted}{rust}
+fn main() {
+    println!("{}", Cat.name());
+    println!("{}", Dolphin.name());
+}
+\end{minted}
+However, we cannot call the \rust{name} method with \rust{NoNameSorry} because we did not explicitly provide an \rust{impl} of the \rust{Named} trait for this type:
+\begin{minted}{rust}
+fn main() {
+    println!("{}", NoNameSorry.name());
+    //                         ^^^^^^
+    // error[E0599]: no method named `name`
+    // found for type `NoNameSorry` in the
+    // current scope
+}
+\end{minted}
+
+Traits on their own do not \textit{look} especially useful. However they can be combined with generics in order to achieve compile time polymorphism.
+
+\subsection{Generics} \label{generics}
+Generics are a way to express that some Rust construction is universally quantified over a set of types. They can be used with most Rust constructions:
+\begin{minted}{rust}
+// A generic type.
+struct Type<T>;
+
+// A generic trait.
+trait Trait<T> { }
+
+// A generic function.
+fn foo<U, V>(arg1: U, arg2: V) { }
+\end{minted}
+In this context, the letters \rust{T}, \rust{U} and  \rust{V} are called \textit{type parameters} or \textit{type variables}, i.e. they are variables designating some arbitrary type which value will be provided later. Such generic constructions can be seen as functions mapping one or multiple types to another type. For example, we can see the generic type \rust{struct Type<T>} as a function:
+\[
+    \mrust{T} \longmapsto \mrust{Type<T>}
+\]
+which takes a type \rust{T} as an argument (which is to be provided by a programmer) and gives back a new type \rust{Type<T>}. Generic constructions are injective, e.g. \rust{Type<T> = Type<U>} $\Longrightarrow$ \rust{T = U}.
+
+We said earlier that generics enable universal quantification over \textit{a set} of types. But until now, we have only seen universal quantification over the set of all types. The issue is that since we are using type parameters which can be absolutely \textit{any} type, we cannot do any operation on these types since we know nothing about them. For example, we cannot do the following:
+\begin{minted}{rust}
+fn print_name<T>(arg: &T) {
+    println!("{}", arg.name());
+//                     ^^^^^^
+// error[E0599]: no method named `name`
+// found for type `&T` in the current scope
+}
+\end{minted}
+because there exist some types which provide a \rust{named} method and others which don't, and since our function is quantified over the set of all types, it has to work with all types \rust{T}.
+
+We can restrict the set of types over which we quantify by using \textit{trait bounds}. For example, here is a generic function which only accepts types implementing the \rust{Named} trait:
+\begin{minted}{rust}
+fn print_name<T>(arg: &T) where T: Named {
+    println!("{}", arg.name());
+}
+\end{minted}
+We used a \rust{where} clause to restrict the values of \rust{T} to types which implement the \rust{Named} trait. Since every type which implements \rust{Named} has to provide a method called \rust{name} which returns a \rust{String}, our generic function \rust{print_name} now typechecks.
+
+Genericity is used for writing highly reusable code. For example considering our previous function \rust{print_name}, a programmer just has to implement the \rust{Named} trait for their own types in order to use it with these types. Taking back our \rust{Cat} and \rust{Dolphin} types for which we implemented \rust{Named}, now we can do:
+\begin{minted}{rust}
+fn main() {
+    print_name(&Cat);
+    print_name(&Dolphin);
+}
+\end{minted}
+and if we want to use it with another type, we just have to implement the \rust{Named} trait for this type.
+
+Generics and traits are especially powerful when one starts using generic \rust{impl} blocks. This is something we have not yet seen so far, but \rust{impl} blocks can carry type parameters as well, for example:
+\begin{minted}{rust}
+// A generic type which carries an anonymous
+// field of type `T`.
+struct Wrapper<T>(T);
+
+// For all `T` implementing `Named`, we
+// decide to also implement `Named` for
+// `Wrapper<T>`.
+impl<T> Named for Wrapper<T>
+    where T: Named
+{
+    fn name(&self) -> String {
+        "Wrapper(".to_string()
+        + &self.0.name()
+        + ")"
+    }
+}
+
+fn main() {
+    print_name(&Wrapper(Cat));
+    print_name(&Wrapper(Dolphin));
+}
+\end{minted}
+and now the magic is that, because \rust{Cat} and \rust{Dolphin} implement \rust{Named}, then \rust{Wrapper<Cat>} and \rust{Wrapper<Dolphin>} also implement \rust{Named} thanks to the universally quantified \rust{impl} block, even if we did not write \textit{specific} implementations for these two types.
+
+\subsection{Type inference} \label{ty-inference}
+The last feature we will need to cover is type inference. As in most modern languages, Rust lets the programmer omit the types of local variables and type parameters when the compiler can infer a type for them. Rust's type inference is based on the one offered by the Hindley-Milner type system \cite{inference1} \cite{inference2}. Example:
+\begin{minted}{rust}
+fn foo() -> String {
+    "hello".to_string()
+}
+
+struct Wrapper<T>(T);
+
+fn main() {
+    // Explicit type annotations.
+    let a: String = foo();
+    
+    // Rust infers that the type of `b` is
+    // `String`.
+    let b = foo();
+    
+    // Explicitly provide a value for the
+    // `T` type parameter.
+    let c = Wrapper::<i32>(5);
+    
+    // Here again Rust can infer it for you.
+    let d = Wrapper(5);
+}
+\end{minted}
+
+What is interesting with Rust's type inference is the fact that Rust may use trait method calls in order to infer types. This can be illustrated with a generic trait:
+\begin{minted}{rust}
+// A generic trait expressing that the type
+// implementing this trait can be converted
+// into the `U` type.
+trait Into<U> {
+    fn into(self) -> U;
+}
+
+// A 32-bits integer type `i32` can be
+// safely converted into a 32-bits floating
+// point type `f32`.
+impl Into<f32> for i32 {
+    fn into(self) -> f32 {
+        self as f32
+    }
+}
+
+fn main() {
+    // `b` is of type `f32`.
+    let b = 5.into();
+}
+\end{minted}
+What happens here is that when we call the \rust{into} method with \rust{5} which is of type \rust{i32}, Rust will see that the \rust{into} method can be found into the generic \rust{trait Into<U>} trait. Hence, it will search for a specific type \rust{U} such that \rust{i32} implements \rust{Into<U>}. The only solution to this problem is \rust{U = f32}, hence Rust can infer that \rust{b} is of type \rust{f32}. However, if we have multiple possible solutions for \rust{U}, such as in:
+\begin{minted}{rust}
+// As we said, an `i32` can be converted into
+// an `f32`.
+impl Into<f32> for i32 {
+    fn into(self) -> f32 {
+        self as f32
+    }
+}
+
+// An `i32` can also be safely converted into
+// a 64-bits floating point type `f64`.
+impl Into<f64> for i32 {
+    fn into(self) -> f64 {
+        self as f64
+    }
+}
+\end{minted}
+then Rust will ask us to write explicit type annotations, since it cannot know whether we meant \rust{f32} or \rust{f64}:
+\begin{minted}{rust}
+fn main() {
+    let b = 5.into();
+//            ^^^^^^
+// error[E0282]: type annotations needed
+}
+\end{minted}
+
+We now have all the tools to deal with the main topic of this report, which is writing a normative implementation of Rust's trait system.
+
+\section{A normative implementation of Rust traits}
+\subsection{Typechecking generics} \label{typeck}
+
+Recall the \rust{Named} trait that we introduced earlier:
+\begin{minted}{rust}
+trait Named {
+    fn name(&self) -> String;
+}
+\end{minted}
+We saw in a previous subsection an example of a generic function which does not typecheck:
+\begin{minted}{rust}
+fn print_name<T>(arg: &T) {
+    println!("{}", arg.name());
+//                     ^^^^^^
+// error[E0599]: no method named `name`
+// found for type `&T` in the current scope
+}
+\end{minted}
+and another one which does:
+\begin{minted}{rust}
+fn print_name<T>(arg: &T) where T: Named {
+    println!("{}", arg.name());
+}
+\end{minted}
+Inside both functions, we are trying to call the \rust{name} method with an argument of type \rust{T}. Since the \rust{name} method is defined in the \rust{Named} trait, we are pushing a \rust{T: Named} constraint. Given all the information that Rust has access to inside the function, Rust will try to prove this constraint.
+
+Inside the first function (the one without the \rust{where} clause), we know nothing about \rust{T}. This means that the goal Rust is trying to prove is the following:
+\[
+\forall \mrust{T}, \mrust{T: Named}
+\]
+Of course it will fail since there exists some type \rust{T} which does not implement \rust{Named} (recall that the default behavior for a type is to \textit{not} implement a given trait, the programmer has to write explicit \rust{impl} blocks), hence the function does not typecheck.
+
+However in the second function, we do have an information about the type variable \rust{T} which is given by the \rust{where T: Named} clause. The goal Rust is trying to prove is then:
+\[
+\forall \mrust{T}, \left( \mrust{T: Named} \Longrightarrow \mrust{T: Named} \right)
+\]
+which is trivially statisfiable.
+
+The general algorithm for checking trait constraints inside a function could be roughly summarized as follows:
+\begin{itemize}
+    \item given a generic function:
+    \begin{minted}{rust}
+    fn F<T1, ..., Tn>(...) -> T0
+        where W1, ..., Wk
+    \end{minted}
+    with type parameters $\mrust{T0}, \mrust{T1}, ... \mrust{Tn}$ and \rust{where} clauses $\mrust{W1}, ..., \mrust{Wk}$ which are predicates over the type parameters $\mrust{T0}, \mrust{T1}, ... \mrust{Tn}$
+    
+    \item retrieve all trait constraints $\mrust{C1}, ..., \mrust{Cm}$ implied by the body of \rust{F} which are again predicates over the type parameters $\mrust{T0}, \mrust{T1}, ... \mrust{Tn}$
+    
+    \item prove the following goal:
+    \[
+        \forall \mrust{T0}, \mrust{T1}, ... \mrust{Tn}, (\mrust{W1} \land ... \land  \mrust{Wk} \Longrightarrow \mrust{C1} \land ... \land \mrust{Cm})
+    \]
+\end{itemize}
+
+Until now, we have only seen easily satisfiable or unsatisfiable goals. But since we can have generic traits and \rust{impl} blocks, we can build more complex goals. Recall the generic \rust{Into} trait:
+\begin{minted}{rust}
+trait Into<U> {
+    fn into(self) -> U;
+}
+\end{minted}
+Now suppose we have the following \rust{impl}:
+\begin{minted}{rust}
+impl<T> Into<String> for T where T: Named {
+    fn into(self) -> String {
+        self.name()
+    }
+}
+\end{minted}
+Basically we are saying that every type \rust{T} implementing \rust{Named} can be converted into a \rust{String}, the conversion being made by calling the \rust{name} method. Now given the following function:
+\begin{minted}{rust}
+fn foo<T>(arg: T) where T: Named {
+    let s = arg.into();
+}
+\end{minted}
+since we are calling the \rust{into} method on \rust{arg} which is of type \rust{T}, Rust has to prove the following goal in order to typecheck \rust{foo}:
+\[
+    \forall \mrust{T}, (\mrust{T: Named} \Longrightarrow \exists \mrust{U}, \mrust{T: Into<U>})
+\]
+Now the problem is that we do not have anything which talks about \mrust{T: Into<U>} inside our \rust{where} clauses, the only thing we know is \rust{T: Named}. But considering our previous \rust{impl}:
+\begin{minted}{rust}
+impl<T> Into<String> for T where T: Named {
+    /* ... */
+}
+\end{minted}
+this can be translated into the following inference rule:
+\[
+\frac{
+        \Gamma \vdash \mrust{T: Named}
+    }{
+      \Gamma \vdash \mrust{T: Into<String>}
+    }
+\]
+where $\Gamma$ is our current environment. Now we can have a formal proof that our \rust{foo} function typechecks:
+\[
+\frac {}{
+\displaystyle \frac {\mrust{T: Named} \vdash \mrust{T: Named} }
+{
+\displaystyle \frac { \mrust{T: Named} \vdash \mrust{T: Into<String>} }
+{
+\displaystyle \frac { \mrust{T: Named} \vdash \exists \mrust{U}, \mrust{T: Into<U>} } {
+\displaystyle \frac { \vdash \mrust{T: Named} \longrightarrow \exists \mrust{U}, \mrust{T: Into<U>} }
+{ \vdash \forall \mrust{T}, \mrust{T: Named} \longrightarrow \exists \mrust{U}, \mrust{T: Into<U>} }
+}
+}
+}
+}
+\]
+Notice the existential quantifier in our goal and what we have seen in section \ref{ty-inference}: this means that when proving the goal, we have to work with the type inference system as well, for example reporting an error if there are multiple solutions for \rust{U} or if the solution we (possibly) found is incompatible with our current knowledge of the local types in the function, and we should be using this knowledge in our proof search as well.
+
+These examples show that for implementing Rust's trait system, we need to solve the following constraints:
+\begin{itemize}
+    \item we need to be able to prove arbitrarily complex first order logic theorems
+    \item this should be done in a constructive way, i.e. all the existentials should have a concrete value at the end of our proof search
+    \item we need to use \rust{impl} blocks as building blocks for our proofs
+    \item we need our proof search to interact with the type inference system (and possibly introduce inference variables in the proof for types which are not known yet)
+\end{itemize}
+
+\subsection{Rust compiler's implementation of the trait system}
+
+The Rust compiler does of course provide a fully working implementation of the trait system. However, this implementation has some flaws. First of all, it does not feature a full blown proof searcher, but rather a more \textit{ad hoc} solver. Hence, the implementation is rather complex and difficult to grasp as a whole, and a formalization is out of reach. This results in bugs being found on a regular basis\footnote{e.g. see this bug \url{https://github.com/rust-lang/rust/issues/43784} which I've fixed recently}, and makes the trait system hard to maintain and to extend\footnote{this has blocked some desired extensions to the trait system, like \url{https://github.com/rust-lang/rfcs/pull/1598}}. Moreover, the implementation prevents from widely applying some useful optimizations like caching.
+
+With these issues in mind, Nicholas Matsakis decided\footnote{his first blog post about this can be found here: \url{http://smallcultfollowing.com/babysteps/blog/2017/01/26/lowering-rust-traits-to-logic/}} to write a new implementation of the trait system in the form of a logic programming language, which would serve as a normative implementation of the trait system and as a basis for a rewrite of the compiler's implementation: this is the \textit{Chalk} project \cite{chalk}.
+
+\subsection{Chalk, an automated prover for trait constraints}
+
+Chalk basically consists of two layers. First, Chalk can parse pseudo-Rust\footnote{we don't need to parse all the synctatic sugar that can be found in Rust code, hence we only parse a simpler subset of Rust} code and lowers the various Rust constructions into logical inference rules. This is the same thing as when we manually translated the generic impl in subsection \ref{typeck} into a logical rule. Then, Chalk also acts as an interpreter for a small language for writing theorems (that we call \textit{goals} because some can be proved and some cannot). Chalk will use its proof search engine and try to prove our goals. If it cannot find a proof, Chalk would just output an error.
+
+Chalk takes its inspiration from Prolog and $\lambda$Prolog logic programming languages. It supports universal and existential quantifiers in goals, as well as implications, similarly to $\lambda$Prolog \cite{lprolog}. A big difference with these two languages lies in the kinds of answer that Chalk provides as we will see later. Within Chalk, we value simplicity over efficiency. Our goal is to have an easily understandable implementation of the trait system about which we can reason.
+
+Let us focus a bit on the first layer. Translating Rust constructions into logical rules is pretty straightforward: Chalk provides an intermediate representation for representing Rust constructions like types and traits as well as logical rules and goals. If we take back our generic \rust{impl} found in subsection \ref{typeck}:
+\begin{minted}{rust}
+trait Named { /* ... */ }
+trait Into<U> { /* ... */ }
+
+impl<T> Into<String> for T where T: Named {
+    /* ... */
+}
+\end{minted}
+Chalk will translate the \rust{impl} into the following inference rule, in the form of a Horn clause:
+\[
+    (\mrust{T: Into<String>}) \pif (\mrust{T: Named})
+\]
+The symbol $\pif$ is to be read as \textit{if}, it is a notation coming from Prolog. So our rule reads "\rust{T} implements \rust{Into<String>} if \rust{T} implements \rust{Named}". And that's it. Types and trait declarations also lower to some special logical rules, but we will cover that later.
+
+As for the proof search engine, it uses a classic SLD resolution algorithm working in a depth-first fashion, like Prolog \cite{sld}. It is tightly coupled with a unification algorithm based on \cite{robinson} (the same algorithm is used in the Rust compiler for type inference) which unifies goals with inference rules and which also deals with some specificities of Rust's type system\footnote{associated types for example, that we do not cover here}. Let us see an actual goal that we can write in the interpreter in order to understand how the proof search engine works. We will consider the following pseudo-Rust program\footnote{we will now skip the bodies of trait and \rust{impl} declarations}:
+\begin{minted}{rust}
+trait Named { }
+trait Into<U> { }
+
+struct Cat;
+
+impl Named for Cat { }
+
+impl<T> Into<String> for T where T: Named { }
+\end{minted}
+which lowers to the following set of inference rules:
+\[
+    \begin{aligned}
+    & \mrust{Cat: Named}. \\
+    & (\mrust{T: Into<String>}) \pif (\mrust{T: Named})
+    \end{aligned}
+\]
+Notice that the first rule does not have a $\pif ...$ part: this is because \rust{Cat} implements {Named} unconditionally, i.e. this is a ground fact that we hold for true. Now here is a goal that we might ask to the Chalk interpreter:
+\begin{minted}{rust}
+exists<T> {
+    exists<U> {
+        T: Into<U>
+    }
+}
+\end{minted}
+An \rust{exists} block introduces an existential variable, this means that the previous goal reads as "does there exist a type \rust{T} and a type \rust{U} such that \rust{T} implements \rust{Into<U>}". Now, first of all the proof searcher will get rid of the existentials by reducing the goal to Skolem normal form. The skolemized goal is now:
+\[
+\mrust{?T: Into<?U>}
+\]
+where \rust{?T} and \rust{?U} are the skolemized constants mapping to the old existential variables. The proof search engine will then try to unify this goal with the conclusion of an inference rule (i.e. the left part before the $\pif$ symbol). Here, it can unify our goal with the conclusion of the inference rule given by:
+\[
+(\mrust{?V: Into<String>}) \pif (\mrust{?V: Named})
+\]
+by setting \rust{?U = String} and \rust{?T = ?V}. Hence, the new goal to prove is \rust{?T: Named}. The proof search engine can now unify this goal with the ground fact \rust{Cat: Named} by setting \rust{?T = Cat}. Since there are no more hypothesis to prove, and we have values for the two existentials, Chalk can give the final answer:
+\begin{minted}{text}
+Unique; substitution [
+    ?T := Cat,
+    ?U := String
+]
+\end{minted}
+Notice the use of the word \textit{unique}. We are dealing with existential variables now, and if we recall what was said in subsection \ref{ty-inference}, existential variables are linked to type inference. This means that we \textit{do} want a unique solution for the existentials. If we find multiple solutions, we will report an ambiguity. For example, if we add this \rust{impl}:
+\begin{minted}{rust}
+struct Dolphin;
+
+impl Named for Dolphin { }
+\end{minted}
+and if we ask the exact same goal as previously, Chalk's final answer will now be:
+\begin{minted}{text}
+Ambiguous; definite substitution [
+    ?U := String
+]
+\end{minted}
+we do not have a substitution for \rust{?T} now because there are multiple possible solutions (namely \rust{Cat} and \rust{Dolphin}). However, we are still sure that \rust{?U} is \rust{String}.
+
+This is why Chalk's answers differ from traditional logic programming interpreters like Prolog. In Prolog, there are basically two possible answers: either there is a solution, or there isn't. In the case where there is a solution, one solution amongst possibly many others will be proposed. Then, a user \textit{can} ask Prolog to relaunch the computation in order to find another solution, and so on, until all solutions are found (in case there are finitely many of them). In Chalk, we care about whether there exists a \textit{unique} solution or not. This has consequences on the computational model used internally: in Prolog, there are a lot of heuristics to select a branch in the proof tree which has a "good chance" to give a solution in order to speed up computation. In Chalk, we still have to explore all branches of the proof tree in order to be sure that there is a unique solution. Of course in case there are no solution at all, both Prolog and Chalk will have to traverse the whole proof tree.
+
+\subsection{Recursion}
+
+Now there is a catch, because Rust's trait system is Turing-complete\footnote{an implementation of a known Turing-complete language within the Rust compiler's implementation of the trait system can be found here: \url{https://sdleffler.github.io/RustTypeSystemTuringComplete/}}. This is not surprising, but this means that Chalk also has some computational power. For example, one can easily implement Peano arithmetic in Chalk. We start by defining some \textit{ad hoc} types and traits:
+\begin{minted}{rust}
+struct Zero { }
+struct Succ<N> { }
+
+trait Add<A, B> { }
+
+impl<B> Add<Zero, B> for B { }
+impl<A, B, C> Add<Succ<A>, B> for Succ<C>
+    where C: Add<A, B> { }
+\end{minted}
+So the \rust{Zero} type is meant to represent... well, $0$, and \rust{Succ<N>} is meant to represent $\mrust{N} + 1$. Now, we defined a generic \rust{Add} trait which basically expresses that \rust{C} implements \rust{Add<A, B>} if $\mrust{C} = \mrust{A} + \mrust{B}$. Let's see if our construction works by asking Chalk to prove the following goal:
+\begin{minted}{rust}
+exists<T> {
+    T: Add<Succ<Succ<Zero>>, Succ<Zero>>
+}
+\end{minted}
+and now let's have a look at Chalk's answer:
+\begin{minted}{text}
+Unique; substitution [
+    ?T := Succ<Succ<Succ<Zero>>>
+]
+\end{minted}
+Great, so we just computed $2 + 1$ within Chalk. One could now implement multiplication as well and get a model of Peano arithmetic within Rust traits.
+
+But now, this means that we have to deal with infinite loops. Indeed, consider this trait definition:
+\begin{minted}{rust}
+trait Foo { }
+
+impl<T> Foo for T where Succ<T>: Foo { }
+\end{minted}
+along with this goal:
+\begin{minted}{text}
+exists<T> { T: Foo }
+\end{minted}
+The issue here is that there exists an infinite branch in the proof tree, namely:
+\[
+    \begin{aligned}
+    (\mrust{T: Foo}) &\pif (\mrust{Succ<T>: Foo}) \\
+    (\mrust{Succ<T>: Foo}) &\pif (\mrust{Succ<Succ<T>>: Foo}) \\
+    (\mrust{Succ<Succ<T>>: Foo}) &\pif ...
+    \end{aligned}
+\]
+and then the proof search engine will fall into an infinite recursion trying to explore this branch.
+
+Of course as we know, detecting infinite recursion in the general case is undecidable. Yet, there exist some ways to detect simple cases of infinite recursion. A case which often appears in Rust programs is the following:
+\[
+    \begin{aligned}
+    \mrust{P} &\pif \mrust{Q1} \\
+    \mrust{Q1} &\pif \mrust{Q2} \\
+    &... \\
+    \mrust{Qn} &\pif \mrust{P}
+    \end{aligned}
+\]
+that is, we are trying to prove a goal \rust{P}, and while exploring the proof tree, we meet \rust{P} again. We will call such a case a \textit{cycle}. Here is an example of a trivial cycle:
+\begin{minted}{rust}
+trait Foo { }
+impl<T> Foo for T where T: Foo { }
+\end{minted}
+which lowers to the following cycle:
+\[
+    (\mrust{T: Foo}) \pif (\mrust{T: Foo})
+\]
+An easy way to detect those cycles is to maintain a data structure which records the goals we have already seen while exploring the proof tree. This way when treating a goal, if it is already present in the data structure, we know there is a cycle in the proof tree. Now the question is: what shall we do if we detect such a cycle? An attractive answer is to simply prune such a branch in the proof tree. After all, we are staring at a proof of the form $\mrust{P} \pif ... \pif \mrust{P}$ which is tautological, so this could be discarded. That would work well if we only had universal quantification. But in the presence of existential quantification, this can lead us to overconfidence about the uniqueness of a solution. Consider now the following example, which is a very common pattern in Rust:
+\begin{minted}{rust}
+struct Array<T> { }
+
+trait Clone { }
+
+// Lowers to `i32: Clone`.
+impl Clone for i32 { }
+
+// Lowers to `(Array<T>: Clone) :- (T: Clone)`.
+impl<T> Clone for Array<T> where T: Clone { }
+\end{minted}
+and the goal we are trying to prove is:
+\begin{minted}{rust}
+exists<T> { T: Clone }
+\end{minted}
+After skolemizing the goal, we are trying to prove \rust{?T: Clone} where \rust{?T} is a skolemized constant. There is a first branch in the proof tree, which is finite and which definitely applies if we unify \rust{?T} with \rust{i32}, namely \rust{i32: Clone}. However, there is another branch that applies: if we unify \rust{?T} with \rust{Array<?U>}, then we can use the inference rule: 
+\[
+\mrust{(Array<?U>: Clone)} \pif (\mrust{?U: Clone})
+\]
+and we are now trying to prove the goal \rust{?U: Clone}. But this goal is strictly isomorphic to our initial goal \rust{?T: Clone}, since we just changed the name of the skolemized constant. So we are facing a cycle. If we discard this branch, our final answer will be:
+\begin{minted}{text}
+Unique; substitution [
+    ?T := i32
+]
+\end{minted}
+but this is wrong since actually there are infinitely many solutions, namely \rust{i32}, \rust{Array<i32>}, \rust{Array<Array<i32>>}, ... so we should have answered ambiguous.
+
+What we will do in order to solve this problem is to use a memoization technique called tabling. The key idea is, in addition to storing the goals we have already seen, we will also store a solution for these goals in case one has already been computed. Now, when encountering a cycle for a goal \rust{G}, there are two possible options. Either we have already found one solution for \rust{G}, and in that case, we use that solution. Or we haven't, and in that case we just return an error. In both cases, we report that we found a cycle. When we have finished to explore the whole proof tree, we check whether a cycle has been encountered during our search. If this is the case, we just rerun the whole search, knowing that we may have found answers in other branches which will serve when we face the cycles again. While the answer of the new search is different from the previous answer, we continue to rerun the search. In our case, this algorithm clearly terminates because each rerun can only increase the number of solutions, and as soon as we have at least two solutions, we just answer \mintinline{text}{Ambiguous} and we do not care anymore about other solutions. This could be summarized with the following pseudo-code:
+\begin{minted}{text}
+treat_goal(g):
+    if g has already been seen:
+        g.cycle := true
+        if g.answer != nil:
+            return g.answer
+        else:
+            return ERROR
+    
+    register that we have seen g
+    
+    g.answer := nil
+    new_answer := nil
+    while true:
+        try to prove g by making recursive
+        calls to `treat_goal` and store the
+        result into `new_answer`
+        
+        if g.cycle == false:
+            g.answer := new_answer
+            break
+        else if new_answer == g.answer:
+            break
+        else:
+            g.answer := new_answer
+    return new_answer
+\end{minted}
+This approach was found in \cite{cycles} and we have now implemented it in Chalk.
+
+An example could help, so we will just use our previous code snippet:
+\begin{minted}{rust}
+struct Array<T> { }
+
+trait Clone { }
+
+// Lowers to `i32: Clone`.
+impl Clone for i32 { }
+
+// Lowers to `(Array<T>: Clone) :- (T: Clone)`.
+impl<T> Clone for Array<T> where T: Clone { }
+\end{minted}
+with our previous goal again:
+\begin{minted}{rust}
+?T: Clone
+\end{minted}
+For the sake of the example, let's say that we start with unifying \rust{?T} with \rust{Array<?U>}, hence using the rule:
+\[
+    (\mrust{Array<?U>: Clone}) \pif (\mrust{?U: Clone})
+\]
+so we immediately see a goal \rust{?U: Clone} which is isomorphic to our initial one. Since we still do not have an answer for that goal, we discard that branch but indicate that we have found a cycle. There is another branch which applies: we can unify \rust{?T} with \rust{i32} and use the ground fact \rust{i32: Clone} in order to derive one solution \rust{?T = i32}. Our search is over, but because we encountered a cycle during the search, we rerun the computation. Now when unifying \rust{?T} with \rust{Array<?U>} and using the rule
+\[
+    (\mrust{Array<?U>: Clone}) \pif (\mrust{?U: Clone})
+\]
+we face \rust{?U: Clone} again, but we now have an answer recorded, which is \rust{?U = i32}. So we use that answer and we substitute inside \rust{?T} to get a final answer \rust{?T = Array<i32>}. But then the same other branch which applied in the previous iteration still applies, so we still have the solution \rust{?T = i32}. So we have at least two solutions, we can stop the search and answer \mintinline{text}{Ambiguous}.
+
+There is a last small catch. Actually sometimes, we \textit{do} want to accept proofs of the form $\mrust{P} \pif ... \pif \mrust{P}$ as an \textit{infinite} proof for the goal \rust{P}. These semantics are called \textit{coinductive semantics} and is an active area of research \cite{coind}. This happens with some special traits which are called \textit{auto traits}\footnote{there is no real standard terminology for this feature actually, because it is still a Rust unstable feature at the moment, but it is widely used in the compiler and standard library internals, and has wide effects on user code}. Unlike normal traits for which you must explicitly opt in, auto traits are automatically implemented for every type unless you explicitly opt out for them. Because they are automatically implemented, this often leads to cycles when generating \rust{impl} blocks for recursive data structures. These cycles could be avoided if the \rust{impl} were written by hand because a human could detect the recursive nature of the data structure, but they are difficult to avoid with a general algorithm which generates such \rust{impl} blocks because recursion in data structures can take complex forms. So the idea is just to give these auto traits a coinductive meaning, that is we accept cycles as infinite proofs for goals of the form \rust{T: AutoTrait} where \rust{AutoTrait} is an auto trait. Of course, coinductive semantics can only be soundly mixed with normal semantics (also called \textit{inductive semantics}) under some specific conditions, which force auto traits to be "less powerful" than normal traits, but they are still of a capital importance in Rust. Currently, the only examples of auto traits found in stable Rust are two special traits used for concurrency. Since concurrency is a key feature of Rust, it is understandable that we would want most types to be automatically usable in concurrent code, which is then done by the use of auto traits. Since we implemented auto traits in Chalk, we have to differentiate inductive cycles from coinductive ones in our cycle detection algorithm.
+
+\subsection{Well-formedness requirements}
+There is something about traits that we did not discuss yet. Recall that we can have trait bounds in the form of \rust{where} clauses on functions and \rust{impl} blocks, as seen in subsection \ref{generics}. Well, traits can also have \rust{where} clauses. The simplest form of where clauses than one can have on a trait are "supertrait" clauses:
+
+\begin{minted}{rust}
+// A trait which expresses that a type
+// implementing it has a partial order.
+trait PartialOrd {
+    /* ... */
+}
+
+// A trait which expresses that a type
+// implementing it has a total order.
+trait Ord where Self: PartialOrd {
+    /* ... */
+}
+\end{minted}
+Notice that we have a \rust{where} clause on the declaration of the \rust{Ord} trait, and moreover we are using a special parameter \rust{Self}. Actually, unlike functions and types, traits are always generic. Indeed, they always carry an implicit type parameter called \rust{Self} which designates the input type when implementing the trait. For example, when writing:
+\begin{minted}{rust}
+impl PartialOrd for i32 {
+    /* ... */
+}
+\end{minted}
+then the \rust{Self} type parameter is replaced by \rust{i32}. So \rust{where} clauses on traits are no different from \rust{where} clauses on functions and impls. For example, \rust{where} clauses on generic functions restrict the set of types which can be used with such a function, whereas \rust{where} clauses on generic \rust{impl} blocks restrict the set of types which will \textit{actually} implement the trait. As for \rust{where} clauses on traits, they restrict the set of types which can be used with that trait. In case there is a \rust{where} clause concerning the \rust{Self} parameter, this means that this restricts the set of types for which you will be able to write an \rust{impl} for that trait. With our \rust{PartialOrd} and \rust{Ord} example, this means that you cannot write an \rust{impl Ord} for a type which does not already implement \rust{PartialOrd}. Example:
+\begin{minted}{rust}
+impl PartialOrd for i32 {
+    /* ... */
+}
+
+// Ok, the trait bound `i32: PartialOrd` is
+// satisfied.
+impl Ord for i32 {
+    /* ... */
+}
+
+// error[E0277]: the trait bound
+// `String: PartialOrd` is not satisfied
+impl Ord for String {
+    /* ... */
+}
+\end{minted}
+Indeed, it makes sense to have a total order for a type only if you already have a partial order for that type.
+
+So the idea is that \rust{where} clauses declared on a trait definition are checked inside the body of an \rust{impl} block. For that, we will introduce a new form of predicate, called a \textit{well-formedness} predicate. We basically say that a trait reference \rust{Self: Trait<A, B, ...>} is well-formed if the types \rust{Self, A, B, ...} satisfy the where clauses declared on the \rust{Trait} trait definition, and we will note \rust{WF(Self: Trait<A, B, ...>)}. Then, inside the body of an \rust{impl} block, we must prove that the trait reference is well-formed. More formally, given:
+\begin{minted}{rust}
+trait Trait<A, B, ...>
+    where W1, ..., Wk
+{
+    /* ... */
+}
+\end{minted}
+we translate this declaration into the following logical rule:
+\[
+    \mrust{WF(Self: Trait<A, B, ...>)} \pif \mrust{W1} \land ... \land \mrust{Wk}
+\]
+and then given an \rust{impl} block for that trait:
+\begin{minted}{rust}
+impl<...> Trait<...> for SelfType
+    where C1, ..., Cm
+{
+    /* ... */
+}
+\end{minted}
+we shall assume that \rust{C1}, ..., \rust{Cm} hold, i.e. we start with an environment $\Gamma = \{ \mrust{C1}, ..., \mrust{Cm} \}$ and inside this environment we shall prove \rust{WF(SelfType: Trait<...>)}. If we cannot prove this goal, we can output an appropriate error.
+
+With our previous \rust{PartialOrd} and \rust{Ord} example:
+\begin{minted}{rust}
+// Lowers to `WF(Self: PartialOrd)`
+// (there are no where clauses, so the
+// well-formedness requirements are
+// trivial).
+trait PartialOrd {
+    /* ... */
+}
+
+// Lowers to `WF(Self: Ord) :- (Self: PartialOrd)`.
+trait Ord where Self: PartialOrd {
+    /* ... */
+}
+
+impl PartialOrd for i32 {
+    // Inside here: we must prove that
+    // `WF(i32: PartialOrd)` holds, which
+    // is trivial.
+}
+
+impl Ord for i32 {
+    // Inside here: we must prove that
+    // `WF(i32: Ord)` holds, which does
+    // because `i32` implements `PartialOrd`.
+}
+
+impl Ord for String {
+    // We must prove that `WF(String: Ord)`
+    // holds: this is not possible since
+    // `String` does not implement PartialOrd.
+}
+\end{minted}
+
+\subsection{Implied bounds}
+Now we will discuss a feature which exists in a very limited form inside the Rust compiler, and for which we prototyped an extension within Chalk. The idea is the following: we will again take our \rust{PartialOrd} and \rust{Ord} traits.
+\begin{minted}{rust}
+trait PartialOrd {
+    /* ... */
+}
+
+trait Ord where Self: PartialOrd {
+    /* ... */
+}
+\end{minted}
+and now consider these two functions:
+\begin{minted}{rust}
+fn only_partial_ord<T>(arg: T)
+    where T: PartialOrd
+{
+    /* ... */
+}
+
+fn only_ord<T>(arg: T)
+    where T: Ord
+{
+    // Inside this function: we know that
+    // `T` implements `Ord`, hence `T`
+    // *must* implement `PartialOrd` as
+    // well.
+    only_partial_ord(arg)
+}
+\end{minted}
+The first function, \rust{only_partial_ord}, is a generic function which only accepts types implementing the \rust{PartialOrd} trait. The second function, \rust{only_ord}, only accepts types implementing the \rust{Ord} trait. The key idea is written in the comment inside \rust{only_ord}: since our type parameter \rust{T} implements \rust{Ord}, and because there is a \rust{where Self: PartialOrd} clause on the \rust{Ord} trait declaration, \rust{T} must \textit{necessarily} implement \rust{PartialOrd}. Hence, we would like to be able to call \rust{only_partial_ord} even if we did not explicitly write a \rust{T: PartialOrd} bound. We would say that such a bound is \textit{implied} by the \rust{T: Ord} bound.
+
+Let's see how we would implement this feature in Chalk. A naive idea would be to have some sort of reverse rule:
+\[
+    (\mrust{T: PartialOrd}) \pif (\mrust{T: Ord})
+\]
+i.e., if we implement \rust{Ord} then we implement \mrust{PartialOrd} as well. However, that does not mix well with the well-formedness requirements. Indeed, say we write this illegal \rust{impl}:
+\begin{minted}{rust}
+// Lowers to `String: Ord`.
+impl Ord for String {
+    /* ... */
+}
+\end{minted}
+Why is this \rust{impl} illegal already? Because we do not meet the well-formedness requirements \rust{WF(String: Ord)}. Indeed, we have the following rule:
+\[
+    \mrust{WF(String: Ord)} \pif (\mrust{String: PartialOrd})
+\]
+and \textit{a priori}, we did not write any \rust{impl PartialOrd} for \rust{String}. But wait, we said we had a rule:
+\[
+    (\mrust{T: PartialOrd}) \pif (\mrust{T: Ord})
+\]
+so this means that we can prove that \rust{String: PartialOrd} holds by proving that \rust{String: Ord} holds. And it does, since we have written an \rust{impl} for that trait! And now we have tricked the trait system into thinking that \rust{String} implements \rust{PartialOrd} whereas we indeed never wrote such an \rust{impl}. These kinds of bugs did occur at some points in the Rust compiler (even recently, see the footnote number 6 on page 8).
+
+Hence, we have to take another approach. The key idea is to have a reverse rule on the well-formedness predicate instead:
+\[
+    (\mrust{T: PartialOrd}) \pif \mrust{WF(T: Ord)}
+\]
+actually this is just seeing the logical rules defining well-formedness predicates as "if and only if" rules. Then, there is a small step to add when parsing Rust programs: every \rust{where} clause of the form \rust{where Type: Trait} a programmer writes must be expanded into the two clauses $\{\mrust{where Type: Trait}, \mrust{where WF(T: Trait)}\}$\footnote{of course the \rust{WF} predicate cannot be used directly by a programmer, it is only expanded inside the intermediate representation used by Chalk}. Now taking back our \rust{only_ord} function:
+\begin{minted}{rust}
+fn only_ord<T>(arg: T)
+    where T: Ord
+{
+    // When parsing, the `T: Ord` bound will
+    // be expanded into `T: Ord`, `WF(T: Ord)`.
+    // Hence, we will be able to rely on the
+    // rule `(T: PartialOrd) :- WF(T: Ord)`.
+    only_partial_ord(arg)
+}
+\end{minted}
+
+As we said, implied bounds already exist in a limited form in the Rust compiler, but their implementation is not satisfying for multiple reasons. The idea of having a more general implied bounds feature has been floating around since 2014, originating from a blog post by Nicholas Matsakis\footnote{\url{http://smallcultfollowing.com/babysteps/blog/2014/07/06/implied-bounds/}}. One main blocker for this feature was a lack of a proper design. Because Chalk offers us a simple and formal model of the trait system, we have been able to outline a working design for this feature within Chalk, and this has resulted in a proposal for an integration into the Rust language\footnote{the proposal can be found here: \url{https://github.com/rust-lang/rfcs/pull/2089}}. Of course the whole design is more complex since it has to cover all Rust constructions, and we also discuss well-formedness predicates and implied bounds for types. But the basic idea of the proposal has just been presented in this subsection.
+
+Interestingly, this is mainly because of this design that we decided to implement a complete cycle detection strategy, because it often led to cycles in the proof tree. We also had to change some parts of the complete design because of other kinds of infinite loops appearing, which were much more difficult to detect. Basically, these loops were always of a form that we have seen previously:
+\begin{minted}{rust}
+trait Foo { }
+
+impl<T> Foo for T where Succ<T>: Foo { }
+\end{minted}
+which creates an infinitely growing branch in the proof tree:
+\[
+    (\mrust{T: Foo}) \pif (\mrust{Succ<T>: Foo}) \pif ...
+\]
+We believe that these loops are difficult to detect, because they seem tightly related to the halting problem: the basic question is, when to stop taking that growing branch? We did find some heuristics, for example in \cite{growing} which tackles the problem inside a fully coinductive setting, and in \cite{kowalski} which discusses loop detection by analysis of differences, but nothing which would completely solve our problem.
+
+\section{Future work}
+As we said, with Chalk we value simplicity over efficiency. This means that Chalk is not extremely suitable for being integrated \textit{as it is} in the compiler. However, what Chalk does well is providing a normative implementation of the trait system, although it is still incomplete for now. Our goal would be to eventually rewrite the trait system in the Rust compiler by implementing an optimized Chalk-like strategy, i.e. featuring a full blown theorem prover using inference rules and so on. We would then be able to check the compiler's implementation against Chalk's normative implementation in order to detect bugs.
+
+Rewriting the trait system in the compiler would unblock some extensions to the language which would be difficult to implement within the current compiler codebase, including our implied bounds proposal. Moreover, it would be less prone to bugs and hopefully be more efficient.
+
+As an intermediate step, we were discussing about experimenting with some efficient implementation strategies, like introducing a byte-code for the proof search engine, and using more efficient caching techniques.
+
+\printbibliography
+\end{document}
